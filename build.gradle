@@ -1,0 +1,154 @@
+import java.util.Properties
+
+plugins {
+    id 'java-library'
+    id 'idea'
+    id 'net.neoforged.moddev' version '2.0.141'
+}
+
+def selectedMcVersion = (findProperty('mcVersion') ?: findProperty('default_mc_version') ?: '1.21.1').toString()
+def versionPropsFile = file("versions/${selectedMcVersion}.properties")
+if (!versionPropsFile.isFile()) {
+    throw new GradleException("Missing version config for ${selectedMcVersion}: ${versionPropsFile}")
+}
+
+def versionProps = new Properties()
+versionPropsFile.withInputStream { versionProps.load(it) }
+versionProps.each { key, value ->
+    ext.set(key.toString(), value.toString())
+}
+
+def releaseOutputDir = rootProject.file("../../releases/WPO-River-Dynamics/${selectedMcVersion}")
+
+evaluationDependsOn(':water_physics_overhaul')
+
+version = wpo_river_mod_version
+group = 'net.skds.wpo.river'
+
+base {
+    archivesName = "wpo_river_dynamics-${minecraft_version}"
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+neoForge {
+    version = neo_version
+
+    runs {
+        client {
+            client()
+            systemProperty 'neoforge.enabledGameTestNamespaces', 'wpo_river_dynamics'
+        }
+
+        server {
+            server()
+            programArgument '--nogui'
+            systemProperty 'neoforge.enabledGameTestNamespaces', 'wpo_river_dynamics'
+        }
+
+        gameTestServer {
+            type = 'gameTestServer'
+            systemProperty 'neoforge.enabledGameTestNamespaces', 'wpo_river_dynamics'
+        }
+
+        configureEach {
+            systemProperty 'forge.logging.markers', 'REGISTRIES'
+            logLevel = org.slf4j.event.Level.DEBUG
+        }
+    }
+
+    mods {
+        wpo_river_dynamics {
+            sourceSet(sourceSets.main)
+        }
+        wpo {
+            sourceSet(project(':water_physics_overhaul').sourceSets.main)
+        }
+        skds_core {
+            sourceSet(project(':skds_core').sourceSets.main)
+        }
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation project(':water_physics_overhaul')
+}
+
+tasks.named('processResources', ProcessResources).configure {
+    def replaceProperties = [
+        minecraft_version      : minecraft_version,
+        minecraft_version_range: minecraft_version_range,
+        neo_version            : neo_version,
+        loader_version_range   : loader_version_range,
+        mod_id                 : 'wpo_river_dynamics',
+        mod_name               : 'WPO: River Dynamics',
+        mod_version            : version,
+        mod_license            : 'All Rights Reserved',
+        mod_authors            : project.findProperty('project_public_author'),
+        mod_description        : 'Rainfall-fed directional river forcing for Water Physics Overhaul.',
+        wpo_version_range      : "[${wpo_mod_version},)"
+    ]
+    inputs.properties replaceProperties
+    filesMatching(['META-INF/neoforge.mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    manifest {
+        attributes([
+            'Specification-Title'   : 'wpo_river_dynamics',
+            'Specification-Vendor'  : project.findProperty('project_public_vendor'),
+            'Specification-Version' : '1',
+            'Implementation-Title'  : project.name,
+            'Implementation-Version': project.version,
+            'Implementation-Vendor' : project.findProperty('project_public_vendor')
+        ])
+    }
+}
+
+def testyInstanceModsDir = file('C:/Users/warcr/curseforge/minecraft/Instances/Testy NeoForge 1.21.1/mods')
+def testyInstanceJarPattern = "wpo_river_dynamics-*.jar"
+
+def cleanTestyInstanceMods = tasks.register('cleanTestyInstanceMods', Delete) {
+    delete fileTree(testyInstanceModsDir) {
+        include testyInstanceJarPattern
+    }
+}
+
+def installToTestyInstance = tasks.register('installToTestyInstance', Copy) {
+    dependsOn cleanTestyInstanceMods
+    dependsOn tasks.named('jar')
+    from(tasks.named('jar', Jar).flatMap { it.archiveFile })
+    into testyInstanceModsDir
+}
+
+tasks.named('assemble').configure {
+    finalizedBy installToTestyInstance
+}
+
+tasks.named('build').configure {
+    finalizedBy installToTestyInstance
+}
+
+tasks.register('stageRelease', Copy) {
+    dependsOn tasks.named('build')
+    from(layout.buildDirectory.dir('libs'))
+    include "${base.archivesName.get()}-${project.version}.jar"
+    into releaseOutputDir
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+idea {
+    module {
+        downloadSources = true
+        downloadJavadoc = true
+    }
+}

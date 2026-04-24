@@ -1,0 +1,34 @@
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+    }
+}
+
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+
+rootProject.name = 'WPO-River-Dynamics'
+
+def resolveSiblingRepo(String name) {
+    [
+        file("../${name}"),
+        file("../${name}/repo")
+    ].find { it.isDirectory() }
+}
+
+def skdsDir = resolveSiblingRepo('SKDS-Core')
+if (!skdsDir) {
+    throw new GradleException('Clone SKDS-Core next to this repository at ../SKDS-Core before building WPO River Dynamics.')
+}
+
+def wpoDir = resolveSiblingRepo('Water-Physics-Overhaul')
+if (!wpoDir) {
+    throw new GradleException('Clone Water-Physics-Overhaul next to this repository at ../Water-Physics-Overhaul before building WPO River Dynamics.')
+}
+
+include 'skds_core'
+project(':skds_core').projectDir = skdsDir
+
+include 'water_physics_overhaul'
+project(':water_physics_overhaul').projectDir = wpoDir
