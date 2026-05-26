@@ -101,6 +101,7 @@ tasks.named('processResources', ProcessResources).configure {
 tasks.named('jar', Jar).configure {
     manifest {
         attributes([
+            'MixinConfigs'          : 'mixins.wpo_river_dynamics.json',
             'Specification-Title'   : 'wpo_river_dynamics',
             'Specification-Vendor'  : project.findProperty('project_public_vendor'),
             'Specification-Version' : '1',
