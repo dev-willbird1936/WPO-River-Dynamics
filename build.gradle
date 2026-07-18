@@ -76,6 +76,12 @@ repositories {
 
 dependencies {
     implementation project(':water_physics_overhaul')
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+tasks.named('test', Test).configure {
+    useJUnitPlatform()
 }
 
 tasks.named('processResources', ProcessResources).configure {
@@ -101,7 +107,6 @@ tasks.named('processResources', ProcessResources).configure {
 tasks.named('jar', Jar).configure {
     manifest {
         attributes([
-            'MixinConfigs'          : 'mixins.wpo_river_dynamics.json',
             'Specification-Title'   : 'wpo_river_dynamics',
             'Specification-Vendor'  : project.findProperty('project_public_vendor'),
             'Specification-Version' : '1',
@@ -112,28 +117,28 @@ tasks.named('jar', Jar).configure {
     }
 }
 
-def testyInstanceModsDir = file('C:/Users/warcr/curseforge/minecraft/Instances/Testy NeoForge 1.21.1/mods')
-def testyInstanceJarPattern = "wpo_river_dynamics-*.jar"
+def modTestingInstanceModsDir = file('C:/Users/warcr/curseforge/minecraft/Instances/Mod Testing/mods')
+def modTestingInstanceJarPattern = "wpo_river_dynamics-*.jar"
 
-def cleanTestyInstanceMods = tasks.register('cleanTestyInstanceMods', Delete) {
-    delete fileTree(testyInstanceModsDir) {
-        include testyInstanceJarPattern
+def cleanModTestingInstanceMods = tasks.register('cleanModTestingInstanceMods', Delete) {
+    delete fileTree(modTestingInstanceModsDir) {
+        include modTestingInstanceJarPattern
     }
 }
 
-def installToTestyInstance = tasks.register('installToTestyInstance', Copy) {
-    dependsOn cleanTestyInstanceMods
+def installToModTestingInstance = tasks.register('installToModTestingInstance', Copy) {
+    dependsOn cleanModTestingInstanceMods
     dependsOn tasks.named('jar')
     from(tasks.named('jar', Jar).flatMap { it.archiveFile })
-    into testyInstanceModsDir
+    into modTestingInstanceModsDir
 }
 
 tasks.named('assemble').configure {
-    finalizedBy installToTestyInstance
+    finalizedBy installToModTestingInstance
 }
 
 tasks.named('build').configure {
-    finalizedBy installToTestyInstance
+    finalizedBy installToModTestingInstance
 }
 
 tasks.register('stageRelease', Copy) {

@@ -1,9 +1,8 @@
 package net.skds.wpo.river;
 
 import java.util.ArrayDeque;
-import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
-import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 
@@ -47,6 +46,7 @@ public final class RiverTicker {
         }
         if ((level.getGameTime() % 200L) == 0L) {
             RiverCurrentField.sweep(level, RiverConfig.COMMON.currentMaxAgeTicks.get());
+            RiverTopologyField.sweep(level);
         }
 
         int budget = Math.max(1, level.players().size() * RiverConfig.COMMON.columnChecksPerPlayer.get());
@@ -115,8 +115,11 @@ public final class RiverTicker {
                 + " biome=" + biome
                 + " amount " + before + "->" + after
                 + " fluid=" + level.getFluidState(waterPos).getType()
-                + " flow=" + flow.map(f -> f.source() + " " + f.direction() + " -> " + format(f.target())).orElse("none")
-                + " current=" + current.map(c -> c.source() + " " + c.direction() + " strength=" + String.format(java.util.Locale.ROOT, "%.2f", c.strength())).orElse("none")
+                + " flow=" + flow.map(f -> f.source() + " " + f.direction() + " -> " + format(f.target())
+                        + " speed=" + String.format(java.util.Locale.ROOT, "%.3f", f.speed())).orElse("none")
+                + " current=" + current.map(c -> c.source() + " " + c.direction()
+                        + " strength=" + String.format(java.util.Locale.ROOT, "%.2f", c.strength())
+                        + " speed=" + String.format(java.util.Locale.ROOT, "%.3f", c.speed())).orElse("none")
                 + " requireRiverBiome=" + RiverConfig.COMMON.requireRiverBiomeForFallback.get()
                 + " channelAxis=" + RiverConfig.COMMON.channelAxisFallback.get();
     }
@@ -131,14 +134,14 @@ public final class RiverTicker {
             return;
         }
 
-        FlowDirective flow = resolveFlow(level, waterPos, amount).orElse(null);
-        if (flow == null) {
+        FlowDirective canonicalFlow = resolveFlow(level, waterPos, amount).orElse(null);
+        if (canonicalFlow == null) {
             RiverCurrentField.clear(level, waterPos);
             return;
         }
 
         TerrariumBridge.TerrariumSample terrarium = allowHydrologyFeed ? TerrariumBridge.sample(level, waterPos).orElse(null) : null;
-        boolean explicitMappedRiver = "osm".equals(flow.source());
+        boolean explicitMappedRiver = "osm".equals(canonicalFlow.source());
         boolean generatedRiver = isGeneratedRiver(level, waterPos);
         if (shouldSkipFallbackRiver(generatedRiver, explicitMappedRiver)) {
             RiverCurrentField.clear(level, waterPos);
@@ -149,18 +152,20 @@ public final class RiverTicker {
         }
 
         long chunkKey = chunkPos.toLong();
-        boolean riverColumn = generatedRiver || explicitMappedRiver || isInferredRiverFlow(flow);
+        boolean riverColumn = generatedRiver || explicitMappedRiver || isInferredRiverFlow(canonicalFlow);
         boolean infiniteSource = allowHydrologyFeed
                 && riverColumn
                 && RiverConfig.COMMON.infiniteRiverSources.get()
-                && isSourceStart(level, waterPos, flow);
+                && isSourceStart(level, waterPos, canonicalFlow);
         if (allowHydrologyFeed) {
             addRunoffBudget(level, data, chunkKey, waterPos, terrarium);
             feedVisibleRiver(level, data, chunkKey, waterPos);
         }
-        double currentStrength = currentStrength(level, data, chunkKey, waterPos, amount, flow);
-        RiverCurrentField.publishColumn(level, waterPos, flow, currentStrength);
-        maybeSpawnCurrentParticle(level, waterPos, flow, currentStrength);
+        double currentStrength = currentStrength(level, data, chunkKey, waterPos, amount, canonicalFlow);
+        RiverCurrentField.publishColumn(level, waterPos, canonicalFlow, currentStrength);
+        FlowDirective flow = orientedFlow(level, waterPos, canonicalFlow);
+        RiverCurrentField.smoothedFlowAt(level, waterPos)
+                .ifPresent(smoothed -> maybeSpawnCurrentParticle(level, waterPos, smoothed, currentStrength));
         moveDownstream(level, data, waterPos, flow, riverColumn);
         if (allowHydrologyFeed) {
             maintainRiverMinimum(level, data, chunkKey, waterPos, riverColumn);
@@ -168,7 +173,29 @@ public final class RiverTicker {
         }
     }
 
+    private static FlowDirective orientedFlow(ServerLevel level, BlockPos source, FlowDirective canonical) {
+        if (!RiverCurrentField.isReversed(level)) {
+            return canonical;
+        }
+        double vx = -canonical.vecX();
+        double vz = -canonical.vecZ();
+        Direction direction = Math.abs(vx) >= Math.abs(vz)
+                ? (vx >= 0.0D ? Direction.EAST : Direction.WEST)
+                : (vz >= 0.0D ? Direction.SOUTH : Direction.NORTH);
+        BlockPos target = downstreamTarget(level, source, direction, true);
+        if (target == null) {
+            target = source.relative(direction);
+        }
+        return new FlowDirective(direction, target, canonical.source(), vx, vz, canonical.speed());
+    }
+
     private static Optional<FlowDirective> resolveFlow(ServerLevel level, BlockPos waterPos, int amount) {
+        if (RiverConfig.COMMON.flatOutletSolver.get() && level.getBiome(waterPos).is(BiomeTags.IS_OCEAN)) {
+            // Oceans/large seas have no meaningful "downstream" - skip the expensive
+            // flat/channel/magnet fallback chain entirely rather than let it search one.
+            return Optional.empty();
+        }
+
         Optional<TerrariumBridge.ProjectionContext> projection = TerrariumBridge.projection(level);
         if (projection.isPresent()) {
             Optional<OsmWaterwayProvider.FlowVector> osm = OSM.findDirection(
@@ -180,14 +207,43 @@ public final class RiverTicker {
             if (osm.isPresent()) {
                 BlockPos target = downstreamTarget(level, waterPos, osm.get().direction(), true);
                 if (target != null) {
-                    FlowDirective flow = new FlowDirective(osm.get().direction(), target, "osm");
-                    return Optional.of(applyWaterBodyMagnetism(level, waterPos, amount, flow));
+                    return Optional.of(new FlowDirective(osm.get().direction(), target, "osm"));
                 }
             }
         }
 
+        RiverTopologyField.Decision topology = RiverTopologyField.resolve(level, waterPos);
+        if (topology.resolved()) {
+            return Optional.ofNullable(topology.flow());
+        }
+
+        Optional<FlowDirective> cached = RiverCurrentField.cachedFlow(level, waterPos);
+        if (cached.isPresent()) {
+            return cached;
+        }
+
         if (!RiverConfig.COMMON.terrainFallbackDirections.get() && !RiverConfig.COMMON.flatOutletSolver.get()) {
             return Optional.empty();
+        }
+
+        // Resolve a channel-shaped reach before comparing one-step terrain drops. A small local
+        // head fluctuation is common in a wide reach; letting it win first makes neighboring
+        // columns choose unrelated bearings and defeats bend/branch continuity.
+        if (RiverConfig.COMMON.channelAxisFallback.get()) {
+            Optional<FlowDirective> channel = resolveChannelAxisFlow(level, waterPos, amount);
+            if (channel.isPresent()) {
+                return channel;
+            }
+        }
+
+        // For bends and tributaries that are not cardinally channel-shaped, resolve the
+        // connected surface route. Its carried first hop preserves local turns without letting
+        // one noisy adjacent column choose a different terrain direction.
+        if (RiverConfig.COMMON.flatOutletSolver.get()) {
+            Optional<FlowDirective> flat = resolveFlatOutletFlow(level, waterPos, amount);
+            if (flat.isPresent()) {
+                return flat;
+            }
         }
 
         int currentHead = absoluteHead(waterPos, amount);
@@ -217,18 +273,13 @@ public final class RiverTicker {
         }
 
         if (bestDirection == null || bestTarget == null) {
-            Optional<FlowDirective> flat = resolveFlatOutletFlow(level, waterPos, amount);
-            if (flat.isPresent()) {
-                return Optional.of(applyWaterBodyMagnetism(level, waterPos, amount, flat.get()));
-            }
-            Optional<FlowDirective> channel = resolveChannelAxisFlow(level, waterPos, amount);
-            if (channel.isPresent()) {
-                return Optional.of(applyWaterBodyMagnetism(level, waterPos, amount, channel.get()));
+            Optional<FlowDirective> bed = resolveBedSlopeFlow(level, waterPos);
+            if (bed.isPresent()) {
+                return bed;
             }
             return resolveMagnetOnlyFlow(level, waterPos, amount);
         }
-        FlowDirective flow = new FlowDirective(bestDirection, bestTarget, "terrain");
-        return Optional.of(applyWaterBodyMagnetism(level, waterPos, amount, flow));
+        return Optional.of(new FlowDirective(bestDirection, bestTarget, "terrain"));
     }
 
     private static Optional<FlowDirective> resolveChannelAxisFlow(ServerLevel level, BlockPos source, int sourceAmount) {
@@ -239,17 +290,67 @@ public final class RiverTicker {
         int maxDistance = RiverConfig.COMMON.channelAxisScanDistance.get();
         AxisCandidate northSouth = axisCandidate(level, source, Direction.NORTH, Direction.SOUTH, maxDistance);
         AxisCandidate westEast = axisCandidate(level, source, Direction.WEST, Direction.EAST, maxDistance);
-        AxisCandidate best = northSouth.score() >= westEast.score() ? northSouth : westEast;
-        if (best.score() < 10) {
+        AxisCandidate primary = northSouth.score() >= westEast.score() ? northSouth : westEast;
+        AxisCandidate secondary = primary == northSouth ? westEast : northSouth;
+        if (primary.score() < 10) {
+            return Optional.empty();
+        }
+        // A round/wide pond scores both axes similarly (long, roughly equal water-run in every
+        // direction) - without this it "qualifies" as channel-shaped and the score deadband's
+        // constant tie-break commits every column to the same arbitrary default (west), which
+        // looks like a real current but isn't. A real channel's cross-axis run is short relative
+        // to its length, so this only excludes bodies that were never channel-shaped to begin with.
+        if (primary.score() < secondary.score() * 2) {
             return Optional.empty();
         }
 
-        Direction downhill = chooseAxisDirection(level, source, sourceAmount, best.negative(), best.positive(), maxDistance);
+        Direction downhill = axisDirection(level, source, sourceAmount, primary, maxDistance);
         BlockPos target = downstreamTarget(level, source, downhill, true);
         if (target == null) {
             return Optional.empty();
         }
-        return Optional.of(new FlowDirective(downhill, target, "channel"));
+
+        // On an angled channel both axes are viable; blend them (weighted by relative score)
+        // into the published vector so the rendered/push direction follows the channel's true
+        // diagonal. The cardinal alone keeps steering transport and consensus votes.
+        double vx = downhill.getStepX();
+        double vz = downhill.getStepZ();
+        if (secondary.score() >= 10) {
+            Direction across = axisDirection(level, source, sourceAmount, secondary, maxDistance);
+            double weight = Math.min(1.0D, secondary.score() / (double) primary.score());
+            vx += across.getStepX() * weight;
+            vz += across.getStepZ() * weight;
+            double len = Math.sqrt(vx * vx + vz * vz);
+            vx /= len;
+            vz /= len;
+        }
+        return Optional.of(new FlowDirective(downhill, target, "channel", vx, vz));
+    }
+
+    // Committed neighbors along the axis outrank re-deriving orientation from water levels:
+    // on a flat reach the level-based score is slosh noise, and independent per-column
+    // coin-flips are exactly what produced opposing patches inside one river.
+    private static Direction axisDirection(ServerLevel level, BlockPos source, int sourceAmount, AxisCandidate axis, int maxDistance) {
+        int votesNegative = 0;
+        int votesPositive = 0;
+        for (Direction walk : new Direction[] { axis.negative(), axis.positive() }) {
+            BlockPos pos = source;
+            for (int i = 0; i < 8; i++) {
+                pos = pos.relative(walk);
+                Direction committed = RiverCurrentField.currentAt(level, pos)
+                        .map(RiverCurrentField.Current::direction)
+                        .orElse(null);
+                if (committed == axis.negative()) {
+                    votesNegative++;
+                } else if (committed == axis.positive()) {
+                    votesPositive++;
+                }
+            }
+        }
+        if (votesNegative != votesPositive) {
+            return votesNegative > votesPositive ? axis.negative() : axis.positive();
+        }
+        return chooseAxisDirection(level, source, sourceAmount, axis.negative(), axis.positive(), maxDistance);
     }
 
     private static AxisCandidate axisCandidate(ServerLevel level, BlockPos source, Direction negative, Direction positive, int maxDistance) {
@@ -275,15 +376,25 @@ public final class RiverTicker {
         return length;
     }
 
+    // a is always the axis' negative direction (NORTH/WEST) so the tied-case pick is a
+    // global constant: independent columns seeding the same flat reach agree by
+    // construction instead of coin-flipping on residual level noise.
     private static Direction chooseAxisDirection(ServerLevel level, BlockPos source, int sourceAmount, Direction a, Direction b, int maxDistance) {
         double scoreA = channelOutletScore(level, source, sourceAmount, a, maxDistance);
         double scoreB = channelOutletScore(level, source, sourceAmount, b, maxDistance);
+        // Feed/slosh transients move run-end heads a few levels (x4 weight); inside that
+        // band the comparison is noise. Real signal - a block of slope over the run - is
+        // 32+ points and clears the band easily.
+        if (Math.abs(scoreA - scoreB) <= 16.0D) {
+            return a;
+        }
         return scoreA >= scoreB ? a : b;
     }
 
     private static double channelOutletScore(ServerLevel level, BlockPos source, int sourceAmount, Direction direction, int maxDistance) {
         BlockPos end = source;
         int run = 0;
+        BlockPos[] tail = new BlockPos[3];
         for (int i = 0; i < maxDistance; i++) {
             BlockPos nextColumn = end.relative(direction);
             BlockPos next = surfaceWaterNear(level, nextColumn.getX(), nextColumn.getZ(), source.getY(), 4);
@@ -291,13 +402,29 @@ public final class RiverTicker {
                 break;
             }
             end = next;
+            tail[run % 3] = next;
             run++;
         }
 
-        int headDrop = absoluteHead(source, sourceAmount) - approximateHead(level, end);
+        // Median head of the last few run columns instead of the single end cell: one fed
+        // or sloshing column at the end otherwise swings the whole direction comparison.
+        int headDrop = absoluteHead(source, sourceAmount) - medianTailHead(level, source, tail, run);
         int terrainDrop = level.getHeight(Heightmap.Types.WORLD_SURFACE, source.getX(), source.getZ())
                 - level.getHeight(Heightmap.Types.WORLD_SURFACE, end.getX(), end.getZ());
         return (headDrop * 4.0D) + (terrainDrop * 2.0D) + run;
+    }
+
+    private static int medianTailHead(ServerLevel level, BlockPos source, BlockPos[] tail, int run) {
+        int count = Math.min(3, run);
+        if (count == 0) {
+            return approximateHead(level, source);
+        }
+        int[] heads = new int[count];
+        for (int i = 0; i < count; i++) {
+            heads[i] = approximateHead(level, tail[i]);
+        }
+        Arrays.sort(heads);
+        return heads[count / 2];
     }
 
     private static Optional<FlowDirective> resolveFlatOutletFlow(ServerLevel level, BlockPos source, int sourceAmount) {
@@ -305,16 +432,36 @@ public final class RiverTicker {
             return Optional.empty();
         }
 
+        // Validate that the source has at least one connected water hop before paying for the
+        // component search. The BFS below carries the first hop with every node; returning that
+        // path-local hop is what makes a bend turn and lets tributaries converge, instead of
+        // making every cell point at the outlet's straight-line bearing.
+        int sourceHopCount = 0;
+        for (Direction direction : Direction.Plane.HORIZONTAL) {
+            BlockPos target = downstreamTarget(level, source, direction, false);
+            if (target == null || !WPOFluidAccess.isChunkLoaded(level, target)
+                    || !WPOFluidAccess.canWaterFlowBetween(level, source, target)
+                    || WPOFluidAccess.getWaterAmount(level, target) <= 0) {
+                continue;
+            }
+            sourceHopCount++;
+        }
+        if (sourceHopCount == 0) {
+            return Optional.empty();
+        }
+
         int sourceHead = absoluteHead(source, sourceAmount);
         int maxCells = RiverConfig.COMMON.flatSolverMaxCells.get();
         int flatTolerance = RiverConfig.COMMON.flatHeadTolerance.get();
         int minOutletDrop = RiverConfig.COMMON.flatMinOutletDrop.get();
+        int minOutletBedDrop = RiverConfig.COMMON.flatMinOutletBedDrop.get();
 
         ArrayDeque<FlatNode> queue = new ArrayDeque<>();
         Set<Long> visited = new HashSet<>();
-        queue.add(new FlatNode(source, null, 0));
+        queue.add(new FlatNode(source, 0, null));
         visited.add(source.asLong());
 
+        BlockPos bestOutletPos = null;
         Direction bestFirstDirection = null;
         double bestScore = Double.NEGATIVE_INFINITY;
 
@@ -325,6 +472,7 @@ public final class RiverTicker {
                 continue;
             }
             int nodeHead = absoluteHead(node.pos(), nodeAmount);
+            int nodeBed = level.getHeight(Heightmap.Types.OCEAN_FLOOR, node.pos().getX(), node.pos().getZ());
 
             for (Direction direction : Direction.Plane.HORIZONTAL) {
                 BlockPos target = downstreamTarget(level, node.pos(), direction, false);
@@ -342,13 +490,27 @@ public final class RiverTicker {
 
                 int targetHead = absoluteHead(target, targetAmount);
                 int drop = nodeHead - targetHead;
-                Direction firstDirection = node.firstDirection() == null ? direction : node.firstDirection();
-                if (drop >= minOutletDrop) {
-                    double score = (drop * 12.0D)
-                            + Math.max(0, node.pos().getY() - target.getY()) * 24.0D
-                            - node.distance();
+                // A wide pool's own slosh can fake a WPO head drop within a few columns without
+                // the ground actually descending - requiring the streambed itself to have
+                // stepped down keeps mid-pool columns from latching onto that as a fake exit.
+                int targetBed = level.getHeight(Heightmap.Types.OCEAN_FLOOR, target.getX(), target.getZ());
+                int bedDrop = nodeBed - targetBed;
+                if (drop >= minOutletDrop && bedDrop >= minOutletBedDrop) {
+                    Direction firstDirection = node.firstDirection() != null
+                            ? node.firstDirection()
+                            : direction;
+                    // Pick one outlet for the whole connected component. Scoring by this
+                    // source's transient head made opposite sides of a broad reach choose
+                    // different exits; lowest bed is stable, while the carried first hop
+                    // still preserves every local bend and tributary path.
+                    double score = (-targetBed * 1000.0D)
+                            + (target.getY() * 0.1D)
+                            - (node.distance() * 0.01D)
+                            - (target.getX() * 0.000001D)
+                            - (target.getZ() * 0.000000001D);
                     if (score > bestScore) {
                         bestScore = score;
+                        bestOutletPos = target;
                         bestFirstDirection = firstDirection;
                     }
                     continue;
@@ -360,24 +522,80 @@ public final class RiverTicker {
 
                 long key = target.asLong();
                 if (visited.add(key)) {
-                    queue.addLast(new FlatNode(target.immutable(), firstDirection, node.distance() + 1));
+                    Direction firstDirection = node.firstDirection() != null
+                            ? node.firstDirection()
+                            : direction;
+                    queue.addLast(new FlatNode(target.immutable(), node.distance() + 1, firstDirection));
                 }
             }
+        }
+
+        if (bestOutletPos == null) {
+            return Optional.empty();
         }
 
         if (bestFirstDirection == null) {
             return Optional.empty();
         }
-
-        BlockPos target = downstreamTarget(level, source, bestFirstDirection, false);
-        if (target == null) {
+        BlockPos bestTarget = downstreamTarget(level, source, bestFirstDirection, false);
+        if (bestTarget == null) {
             return Optional.empty();
         }
-        return Optional.of(new FlowDirective(bestFirstDirection, target, "flat"));
+        return Optional.of(new FlowDirective(bestFirstDirection, bestTarget, "flat"));
+    }
+
+    // A wide, slow river's water surface commonly reads as one flat WPO head for many blocks -
+    // the fluid self-levels faster than the sim publishes new levels - even though the generated
+    // streambed keeps descending underneath. Reading the terrain heightmap directly gives those
+    // reaches a real direction instead of falling through to magnetism (wrong for a river) or
+    // nothing at all. Static terrain has no per-tick slosh, so unlike the head-drop tiers above
+    // this needs no noise-floor threshold beyond "actually downhill".
+    private static Optional<FlowDirective> resolveBedSlopeFlow(ServerLevel level, BlockPos source) {
+        if (!RiverConfig.COMMON.bedSlopeFallback.get()) {
+            return Optional.empty();
+        }
+
+        int sourceBed = level.getHeight(Heightmap.Types.OCEAN_FLOOR, source.getX(), source.getZ());
+        Direction bestDirection = null;
+        BlockPos bestTarget = null;
+        int bestDrop = 0;
+        for (Direction direction : Direction.Plane.HORIZONTAL) {
+            BlockPos target = downstreamTarget(level, source, direction, false);
+            if (target == null || !WPOFluidAccess.isChunkLoaded(level, target)) {
+                continue;
+            }
+            if (!WPOFluidAccess.canWaterFlowBetween(level, source, target)) {
+                continue;
+            }
+            if (WPOFluidAccess.getWaterAmount(level, target) <= 0) {
+                continue;
+            }
+            int targetBed = level.getHeight(Heightmap.Types.OCEAN_FLOOR, target.getX(), target.getZ());
+            int drop = sourceBed - targetBed;
+            if (drop > bestDrop) {
+                bestDirection = direction;
+                bestTarget = target;
+                bestDrop = drop;
+            }
+        }
+        if (bestDirection == null) {
+            return Optional.empty();
+        }
+        return Optional.of(new FlowDirective(bestDirection, bestTarget, "bed"));
     }
 
     private static Optional<FlowDirective> resolveMagnetOnlyFlow(ServerLevel level, BlockPos source, int sourceAmount) {
         if (!RiverConfig.COMMON.waterBodyMagnetism.get()) {
+            return Optional.empty();
+        }
+        // Self-attraction: deep inside a large body of water the mass scan measures that body's
+        // own bulk and returns an arbitrary lobe of it, not a real target. The river biome tag
+        // isn't a reliable signal for this - this mod's own wider carved channels routinely
+        // generate outside the vanilla river biome band - so check the water itself: a
+        // neighborhood this saturated isn't an isolated puddle reaching for a real nearby body,
+        // it's already inside one. 160 is 80% of localWaterMass's 200 ceiling (25 columns x
+        // MAX_FLUID_LEVEL 8).
+        if (localWaterMass(level, source, source.getY()) >= 160) {
             return Optional.empty();
         }
 
@@ -409,70 +627,13 @@ public final class RiverTicker {
     private static boolean isInferredRiverFlow(FlowDirective flow) {
         return flow.source().contains("terrain")
                 || flow.source().contains("flat")
-                || flow.source().contains("channel");
+                || flow.source().contains("channel")
+                || flow.source().contains("topology");
     }
 
     private static boolean isGeneratedRiver(ServerLevel level, BlockPos pos) {
         return RiverConfig.COMMON.generatedRiverReplacement.get()
                 && level.getBiome(pos).is(BiomeTags.IS_RIVER);
-    }
-
-    private static FlowDirective applyWaterBodyMagnetism(ServerLevel level, BlockPos source, int sourceAmount, FlowDirective original) {
-        if (!RiverConfig.COMMON.waterBodyMagnetism.get()) {
-            return original;
-        }
-
-        AttractionVector attraction = waterBodyAttractionVector(level, source);
-        Direction attractedDirection = attraction.direction();
-        if (attractedDirection == null || attraction.strength() < 6.0D) {
-            return original;
-        }
-
-        Direction bestDirection = original.direction();
-        BlockPos bestTarget = original.target();
-        double bestScore = scoreMagnetCandidate(level, source, sourceAmount, original.direction(), original.direction(), bestTarget, attraction);
-
-        for (Direction direction : Direction.Plane.HORIZONTAL) {
-            BlockPos target = magneticTarget(level, source, direction);
-            if (target == null) {
-                continue;
-            }
-
-            double score = scoreMagnetCandidate(level, source, sourceAmount, direction, original.direction(), target, attraction);
-            if (score > bestScore + 0.25D) {
-                bestDirection = direction;
-                bestTarget = target;
-                bestScore = score;
-            }
-        }
-
-        if (bestDirection == original.direction() && bestTarget.equals(original.target())) {
-            return original;
-        }
-        return new FlowDirective(bestDirection, bestTarget, original.source() + "+magnet");
-    }
-
-    private static double scoreMagnetCandidate(
-            ServerLevel level,
-            BlockPos source,
-            int sourceAmount,
-            Direction candidate,
-            Direction original,
-            BlockPos target,
-            AttractionVector attractionVector
-    ) {
-        int sourceHead = absoluteHead(source, sourceAmount);
-        int targetHead = approximateHead(level, target);
-        int headDrop = sourceHead - targetHead;
-        if (headDrop < -RiverConfig.COMMON.magnetMaxUphillHead.get()) {
-            return -1_000_000.0D;
-        }
-
-        double continuity = directionDot(candidate, original) * 4.0D;
-        double gravity = Math.max(-4.0D, Math.min(10.0D, headDrop));
-        gravity += Math.max(0, source.getY() - target.getY()) * 6.0D;
-        double attraction = waterBodyAttractionScore(attractionVector, candidate);
-        return continuity + gravity + attraction;
     }
 
     private static BlockPos magneticTarget(ServerLevel level, BlockPos source, Direction direction) {
@@ -505,22 +666,6 @@ public final class RiverTicker {
         }
         int amount = WPOFluidAccess.getWaterAmount(level, pos);
         return absoluteHead(pos, amount);
-    }
-
-    private static double directionDot(Direction a, Direction b) {
-        int ax = a.getNormal().getX();
-        int az = a.getNormal().getZ();
-        int bx = b.getNormal().getX();
-        int bz = b.getNormal().getZ();
-        return (ax * bx) + (az * bz);
-    }
-
-    private static double waterBodyAttractionScore(AttractionVector vector, Direction candidate) {
-        if (vector.direction() == null || vector.strength() <= 0.0D) {
-            return 0.0D;
-        }
-        double alignment = directionDot(candidate, vector.direction());
-        return alignment > 0.0D ? Math.min(20.0D, vector.strength()) * 0.3D * alignment : 0.0D;
     }
 
     private static AttractionVector waterBodyAttractionVector(ServerLevel level, BlockPos source) {
@@ -607,6 +752,13 @@ public final class RiverTicker {
                 ? RiverConfig.COMMON.flatCurrentStrength.get()
                 : flow.source().contains("osm") ? 0.45D : flow.source().contains("channel") ? 0.42D : flow.source().contains("terrain") ? 0.32D : 0.22D;
 
+        if (Double.isFinite(flow.speed())) {
+            base = RiverHydraulics.biasStrength(
+                    flow.speed(),
+                    RiverConfig.COMMON.minCurrentStrength.get(),
+                    RiverConfig.COMMON.maxCurrentStrength.get());
+        }
+
         int headDrop = absoluteHead(source, sourceAmount) - approximateHead(level, flow.target());
         double slopeBoost = Math.max(0.0D, Math.min(0.45D, headDrop * 0.04D));
         double depthBoost = Math.max(0.0D, Math.min(0.15D, sourceAmount / (double) WPOConfig.MAX_FLUID_LEVEL * 0.15D));
@@ -620,40 +772,60 @@ public final class RiverTicker {
         );
     }
 
-    private static void maybeSpawnCurrentParticle(ServerLevel level, BlockPos pos, FlowDirective flow, double strength) {
-        if (!RiverConfig.COMMON.currentParticles.get() || strength < 0.2D || level.getRandom().nextInt(2) != 0) {
+    private static void maybeSpawnCurrentParticle(
+            ServerLevel level,
+            BlockPos pos,
+            RiverCurrentField.Flow flow,
+            double strength
+    ) {
+        if (!RiverConfig.COMMON.currentParticles.get() || strength < 0.2D) {
             return;
         }
 
-        double speed = Math.min(0.08D, 0.025D + strength * 0.025D);
+        double physicalSpeed = flow.speed();
+        double normalizedSpeed = Mth.clamp(
+                (physicalSpeed - RiverHydraulics.MIN_SPEED)
+                        / (RiverHydraulics.MAX_SPEED - RiverHydraulics.MIN_SPEED),
+                0.0D, 1.0D);
+        int chance = Math.max(3, 10 - Mth.floor(normalizedSpeed * 7.0D));
+        if (level.getRandom().nextInt(chance) != 0) {
+            return;
+        }
+        double length = Math.hypot(flow.x(), flow.z());
+        if (length < 1.0E-6D) {
+            return;
+        }
+        double vx = flow.x() / length;
+        double vz = flow.z() / length;
+        double particleSpeed = 0.02D + normalizedSpeed * 0.07D;
         double y = pos.getY() + Math.min(0.9D, 0.15D + WPOFluidAccess.getWaterAmount(level, pos) / (double) WPOConfig.MAX_FLUID_LEVEL * 0.7D);
-        for (int i = 0; i < 3; i++) {
-            double sideways = (i - 1) * 0.18D;
-            double x = pos.getX() + 0.5D - flow.direction().getStepX() * 0.25D + flow.direction().getStepZ() * sideways;
-            double z = pos.getZ() + 0.5D - flow.direction().getStepZ() * 0.25D - flow.direction().getStepX() * sideways;
+        double sideways = (level.getRandom().nextDouble() - 0.5D) * 0.5D;
+        double x = pos.getX() + 0.5D - vx * 0.25D - vz * sideways;
+        double z = pos.getZ() + 0.5D - vz * 0.25D + vx * sideways;
+        level.sendParticles(
+                ParticleTypes.BUBBLE,
+                x,
+                y,
+                z,
+                0,
+                vx,
+                0.0D,
+                vz,
+                particleSpeed
+        );
+        if (normalizedSpeed > 0.65D && level.getRandom().nextInt(4) == 0) {
             level.sendParticles(
-                    ParticleTypes.BUBBLE,
+                    ParticleTypes.SPLASH,
                     x,
-                    y,
+                    pos.getY() + 1.0D,
                     z,
                     0,
-                    flow.direction().getStepX(),
-                    0.0D,
-                    flow.direction().getStepZ(),
-                    speed
+                    vx,
+                    0.04D,
+                    vz,
+                    particleSpeed
             );
         }
-        level.sendParticles(
-                ParticleTypes.SPLASH,
-                pos.getX() + 0.5D - flow.direction().getStepX() * 0.25D,
-                pos.getY() + 1.0D,
-                pos.getZ() + 0.5D - flow.direction().getStepZ() * 0.25D,
-                1,
-                flow.direction().getStepX() * 0.15D,
-                0.0D,
-                flow.direction().getStepZ() * 0.15D,
-                speed
-        );
     }
 
     private static void feedInfiniteSource(ServerLevel level, BlockPos pos, boolean infiniteSource) {
@@ -770,8 +942,19 @@ public final class RiverTicker {
         }
     }
 
+    // WPO's own fluid engine now moves water between loaded cells on its own (FFluidDefault/
+    // FFluidEQ consult FlowBias for the current direction - see RiverDynamics' registration).
+    // This is only responsible for the case WPO can't handle: draining into virtual reservoir
+    // storage when the downstream cell is in a chunk that isn't loaded to simulate.
     private static void moveDownstream(ServerLevel level, RiverSavedData data, BlockPos source, FlowDirective flow, boolean riverColumn) {
+        if (!riverColumn || !RiverConfig.COMMON.drainAtUnloadedDownstreamEdge.get()) {
+            return;
+        }
         BlockPos target = flow.target();
+        if (WPOFluidAccess.isChunkLoaded(level, target)) {
+            return;
+        }
+
         int sourceAmount = WPOFluidAccess.getWaterAmount(level, source);
         int retainedLevels = retainedLevels(flow, riverColumn);
         int movable = Math.min(RiverConfig.COMMON.maxTransferLevels.get(), Math.max(0, sourceAmount - retainedLevels));
@@ -779,14 +962,11 @@ public final class RiverTicker {
             return;
         }
 
-        if (RiverConfig.COMMON.physicalWaterFlow.get() && riverColumn) {
-            if (!moveOneStep(level, data, source, target, movable, retainedLevels)) {
-                pumpFullRiverPath(level, data, source, flow, movable, retainedLevels);
-            }
-            return;
+        int removed = removeWaterKeeping(level, source, movable, retainedLevels);
+        if (removed > 0) {
+            long downstreamChunk = ChunkPos.asLong(target.getX() >> 4, target.getZ() >> 4);
+            data.addReservoirLevels(downstreamChunk, removed, RiverConfig.COMMON.maxReservoirLevelsPerChunk.get());
         }
-
-        moveOneStep(level, data, source, target, movable, retainedLevels);
     }
 
     private static int retainedLevels(FlowDirective flow, boolean riverColumn) {
@@ -794,161 +974,6 @@ public final class RiverTicker {
             return flow.source().contains("magnet") ? 0 : 1;
         }
         return Math.min(RiverConfig.COMMON.minimumRiverLevel.get(), RiverConfig.COMMON.targetRiverLevel.get());
-    }
-
-    private static boolean moveOneStep(
-            ServerLevel level,
-            RiverSavedData data,
-            BlockPos source,
-            BlockPos target,
-            int movable,
-            int retainedLevels
-    ) {
-        if (!WPOFluidAccess.isChunkLoaded(level, target)) {
-            if (!RiverConfig.COMMON.drainAtUnloadedDownstreamEdge.get()) {
-                return false;
-            }
-            int removed = removeWaterKeeping(level, source, movable, retainedLevels);
-            if (removed > 0) {
-                long downstreamChunk = ChunkPos.asLong(target.getX() >> 4, target.getZ() >> 4);
-                data.addReservoirLevels(downstreamChunk, removed, RiverConfig.COMMON.maxReservoirLevelsPerChunk.get());
-            }
-            return removed > 0;
-        }
-
-        if (!WPOFluidAccess.canWaterFlowBetween(level, source, target)) {
-            return false;
-        }
-        int targetAmount = WPOFluidAccess.getWaterAmount(level, target);
-        int capacity = WPOConfig.MAX_FLUID_LEVEL - targetAmount;
-        int requested = Math.min(movable, capacity);
-        if (requested <= 0) {
-            return false;
-        }
-
-        return transferWater(level, source, target, requested, retainedLevels) > 0;
-    }
-
-    private static boolean pumpFullRiverPath(
-            ServerLevel level,
-            RiverSavedData data,
-            BlockPos source,
-            FlowDirective firstFlow,
-            int requested,
-            int retainedLevels
-    ) {
-        List<BlockPos> path = new ArrayList<>();
-        path.add(source.immutable());
-
-        BlockPos current = source;
-        FlowDirective flow = firstFlow;
-        int maxDistance = RiverConfig.COMMON.physicalFlowChainDistance.get();
-        for (int step = 0; step < maxDistance; step++) {
-            BlockPos target = flow.target().immutable();
-            if (path.contains(target)) {
-                return false;
-            }
-
-            if (!WPOFluidAccess.isChunkLoaded(level, target)) {
-                return drainTailToUnloaded(level, data, path, target, requested, retainedLevels);
-            }
-            if (!WPOFluidAccess.canWaterFlowBetween(level, current, target)) {
-                return false;
-            }
-
-            path.add(target);
-            int targetAmount = WPOFluidAccess.getWaterAmount(level, target);
-            int capacity = WPOConfig.MAX_FLUID_LEVEL - targetAmount;
-            if (capacity > 0) {
-                return shiftPath(level, path, Math.min(requested, capacity), retainedLevels);
-            }
-
-            Optional<FlowDirective> nextFlow = resolveFlow(level, target, targetAmount);
-            if (nextFlow.isEmpty()) {
-                return drainTailToReservoir(level, data, path, requested, retainedLevels);
-            }
-            current = target;
-            flow = nextFlow.get();
-        }
-
-        return drainTailToReservoir(level, data, path, requested, retainedLevels);
-    }
-
-    private static boolean drainTailToUnloaded(
-            ServerLevel level,
-            RiverSavedData data,
-            List<BlockPos> path,
-            BlockPos unloadedTarget,
-            int requested,
-            int retainedLevels
-    ) {
-        if (path.size() <= 1 || !RiverConfig.COMMON.drainAtUnloadedDownstreamEdge.get()) {
-            return false;
-        }
-
-        BlockPos tail = path.get(path.size() - 1);
-        int removed = removeWaterKeeping(level, tail, requested, RiverConfig.COMMON.minimumRiverLevel.get());
-        if (removed <= 0) {
-            return false;
-        }
-
-        long downstreamChunk = ChunkPos.asLong(unloadedTarget.getX() >> 4, unloadedTarget.getZ() >> 4);
-        data.addReservoirLevels(downstreamChunk, removed, RiverConfig.COMMON.maxReservoirLevelsPerChunk.get());
-        return shiftPath(level, path, removed, retainedLevels);
-    }
-
-    private static boolean drainTailToReservoir(
-            ServerLevel level,
-            RiverSavedData data,
-            List<BlockPos> path,
-            int requested,
-            int retainedLevels
-    ) {
-        if (path.size() <= 2) {
-            return false;
-        }
-
-        BlockPos tail = path.get(path.size() - 1);
-        int removed = removeWaterKeeping(level, tail, requested, RiverConfig.COMMON.minimumRiverLevel.get());
-        if (removed <= 0) {
-            return false;
-        }
-
-        data.addReservoirLevels(new ChunkPos(tail).toLong(), removed, RiverConfig.COMMON.maxReservoirLevelsPerChunk.get());
-        return shiftPath(level, path, removed, retainedLevels);
-    }
-
-    private static boolean shiftPath(ServerLevel level, List<BlockPos> path, int requested, int sourceRetainedLevels) {
-        int shiftedFromSource = 0;
-        int amount = requested;
-        for (int i = path.size() - 2; i >= 0 && amount > 0; i--) {
-            BlockPos from = path.get(i);
-            BlockPos to = path.get(i + 1);
-            int retained = i == 0 ? sourceRetainedLevels : RiverConfig.COMMON.minimumRiverLevel.get();
-            amount = transferWater(level, from, to, amount, retained);
-            if (i == 0) {
-                shiftedFromSource = amount;
-            }
-        }
-        return shiftedFromSource > 0;
-    }
-
-    private static int transferWater(ServerLevel level, BlockPos source, BlockPos target, int requested, int retainedLevels) {
-        int targetCapacity = WPOConfig.MAX_FLUID_LEVEL - WPOFluidAccess.getWaterAmount(level, target);
-        int removed = removeWaterKeeping(level, source, Math.min(requested, targetCapacity), retainedLevels);
-        if (removed <= 0) {
-            return 0;
-        }
-
-        int beforeTarget = WPOFluidAccess.getWaterAmount(level, target);
-        int afterTarget = WPOFluidAccess.addWater(level, target, removed);
-        int accepted = Math.max(0, afterTarget - beforeTarget);
-        if (accepted < removed) {
-            WPOFluidAccess.addWater(level, source, removed - accepted);
-        }
-        wakeWater(level, source);
-        wakeWater(level, target);
-        return accepted;
     }
 
     private static int removeWaterKeeping(ServerLevel level, BlockPos pos, int requested, int retainedLevels) {
@@ -1029,7 +1054,7 @@ public final class RiverTicker {
         return null;
     }
 
-    private static BlockPos surfaceWaterNear(ServerLevel level, int x, int z, int centerY, int verticalRadius) {
+    static BlockPos surfaceWaterNear(ServerLevel level, int x, int z, int centerY, int verticalRadius) {
         if (!level.hasChunkAt(new BlockPos(x, level.getMinBuildHeight(), z))) {
             return null;
         }
@@ -1087,7 +1112,7 @@ public final class RiverTicker {
     private record AttractionVector(Direction direction, double strength) {
     }
 
-    private record FlatNode(BlockPos pos, Direction firstDirection, int distance) {
+    private record FlatNode(BlockPos pos, int distance, Direction firstDirection) {
     }
 
     private record AxisCandidate(Direction negative, Direction positive, int score, int negativeRun, int positiveRun) {

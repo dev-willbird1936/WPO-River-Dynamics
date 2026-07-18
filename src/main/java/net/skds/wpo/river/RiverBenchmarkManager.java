@@ -552,7 +552,7 @@ public final class RiverBenchmarkManager {
         json.addProperty("physicalWaterFlow", RiverConfig.COMMON.physicalWaterFlow.get());
         json.addProperty("drainAtUnloadedDownstreamEdge", RiverConfig.COMMON.drainAtUnloadedDownstreamEdge.get());
         json.addProperty("actualRainRunoff", RiverConfig.COMMON.actualRainRunoff.get());
-        json.addProperty("visualCurrentFlow", RiverConfig.COMMON.visualCurrentFlow.get());
+        json.addProperty("currentFlowVectors", RiverConfig.COMMON.currentFlowVectors.get());
         json.addProperty("entityCurrentForces", RiverConfig.COMMON.entityCurrentForces.get());
         json.addProperty("updateInterval", RiverConfig.COMMON.updateInterval.get());
         json.addProperty("surfaceSearchDepth", RiverConfig.COMMON.surfaceSearchDepth.get());

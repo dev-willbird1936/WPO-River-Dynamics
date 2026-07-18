@@ -2,6 +2,9 @@
 build/
 out/
 run/
+bin/
+.eclipse/
+.serena/
 .idea/
 *.log
 INTENTION.md

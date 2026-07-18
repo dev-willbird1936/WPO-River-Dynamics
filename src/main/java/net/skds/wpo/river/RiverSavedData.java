@@ -83,6 +83,7 @@ public final class RiverSavedData extends SavedData {
 
     public void markVisited(ChunkPos pos, long gameTime) {
         chunkLastVisit.put(pos.toLong(), gameTime);
+        setDirty();
     }
 
     public double getReservoirLevels(long chunkKey) {

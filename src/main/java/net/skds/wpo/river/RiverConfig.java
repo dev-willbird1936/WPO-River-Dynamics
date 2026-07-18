@@ -36,6 +36,7 @@ public final class RiverConfig {
         public final ModConfigSpec.BooleanValue terrainFallbackDirections;
         public final ModConfigSpec.BooleanValue flatOutletSolver;
         public final ModConfigSpec.BooleanValue channelAxisFallback;
+        public final ModConfigSpec.BooleanValue bedSlopeFallback;
         public final ModConfigSpec.BooleanValue waterBodyMagnetism;
         public final ModConfigSpec.BooleanValue generatedRiverReplacement;
         public final ModConfigSpec.BooleanValue requireRiverBiomeForFallback;
@@ -43,7 +44,7 @@ public final class RiverConfig {
         public final ModConfigSpec.BooleanValue physicalWaterFlow;
         public final ModConfigSpec.BooleanValue drainAtUnloadedDownstreamEdge;
         public final ModConfigSpec.BooleanValue actualRainRunoff;
-        public final ModConfigSpec.BooleanValue visualCurrentFlow;
+        public final ModConfigSpec.BooleanValue currentFlowVectors;
         public final ModConfigSpec.BooleanValue entityCurrentForces;
         public final ModConfigSpec.BooleanValue currentParticles;
         public final ModConfigSpec.BooleanValue debugLogging;
@@ -56,6 +57,7 @@ public final class RiverConfig {
         public final ModConfigSpec.IntValue channelAxisScanDistance;
         public final ModConfigSpec.IntValue flatHeadTolerance;
         public final ModConfigSpec.IntValue flatMinOutletDrop;
+        public final ModConfigSpec.IntValue flatMinOutletBedDrop;
         public final ModConfigSpec.IntValue waterBodyMagnetRadius;
         public final ModConfigSpec.IntValue targetRiverLevel;
         public final ModConfigSpec.IntValue minimumRiverLevel;
@@ -104,6 +106,12 @@ public final class RiverConfig {
             channelAxisFallback = translate.apply("channelAxisFallback")
                     .comment("Infer a current along long flat surface-water corridors when there is no WPO head drop or mapped river direction.")
                     .define("channelAxisFallback", true);
+            bedSlopeFallback = translate.apply("bedSlopeFallback")
+                    .comment("Infer a current from the streambed's terrain slope when the water surface itself has no WPO head drop."
+                            + " A wide, gently-flowing river's surface commonly sits level for many blocks even though the"
+                            + " generated terrain underneath keeps descending - this reads that terrain directly instead of"
+                            + " leaving the column with no current at all.")
+                    .define("bedSlopeFallback", true);
             waterBodyMagnetism = translate.apply("waterBodyMagnetism")
                     .comment("Bias local river steps toward nearby larger existing water bodies so runoff bends into rivers and lakes instead of marching straight across banks.")
                     .define("waterBodyMagnetism", true);
@@ -125,9 +133,9 @@ public final class RiverConfig {
             actualRainRunoff = translate.apply("actualRainRunoff")
                     .comment("Add storm runoff to river reservoirs only while the sampled river column is exposed to active rain.")
                     .define("actualRainRunoff", true);
-            visualCurrentFlow = translate.apply("visualCurrentFlow")
-                    .comment("Expose cached river currents through WPO fluid flow vectors so flat rivers can render and push like flowing water.")
-                    .define("visualCurrentFlow", true);
+            currentFlowVectors = translate.apply("currentFlowVectors")
+                    .comment("Blend cached river currents into WPO's fluid velocity vector (getVel), which affects both client-side flow rendering and server-side entity fluid-push physics - not rendering alone.")
+                    .define("currentFlowVectors", true);
             entityCurrentForces = translate.apply("entityCurrentForces")
                     .comment("Apply a direct downstream push to entities that do not fully respond to WPO fluid flow vectors, such as boats.")
                     .define("entityCurrentForces", true);
@@ -142,26 +150,43 @@ public final class RiverConfig {
                     .comment("Server ticks between river simulation scans.")
                     .defineInRange("updateInterval", 10, 1, 100);
             sampleRadius = translate.apply("sampleRadius")
-                    .comment("Horizontal radius sampled around each player.")
-                    .defineInRange("sampleRadius", 96, 8, 256);
+                    .comment("Horizontal radius sampled around each player. Currents only exist where sampling reaches; water beyond this renders still.")
+                    .defineInRange("sampleRadius", 128, 8, 256);
             columnChecksPerPlayer = translate.apply("columnChecksPerPlayer")
                     .comment("Candidate columns processed per active player on each update.")
-                    .defineInRange("columnChecksPerPlayer", 192, 1, 256);
+                    .defineInRange("columnChecksPerPlayer", 256, 1, 256);
             surfaceSearchDepth = translate.apply("surfaceSearchDepth")
                     .comment("Vertical blocks searched below the surface heightmap for exposed water.")
                     .defineInRange("surfaceSearchDepth", 24, 1, 96);
             flatSolverMaxCells = translate.apply("flatSolverMaxCells")
-                    .comment("Maximum connected surface-water cells searched when resolving a flat river outlet.")
-                    .defineInRange("flatSolverMaxCells", 512, 8, 4096);
+                    .comment("Maximum connected surface-water cells searched when resolving a flat river outlet."
+                            + " On wide bends and lakes, an origin near the edge of this horizon can miss an outlet"
+                            + " that a column a few blocks closer would find, falling through to channel-axis and"
+                            + " committing a different direction than its neighbors.")
+                    .defineInRange("flatSolverMaxCells", 2048, 8, 4096);
             channelAxisScanDistance = translate.apply("channelAxisScanDistance")
                     .comment("Maximum blocks scanned in each cardinal direction when inferring a flat channel axis.")
                     .defineInRange("channelAxisScanDistance", 56, 8, 160);
             flatHeadTolerance = translate.apply("flatHeadTolerance")
-                    .comment("Maximum WPO head difference treated as the same flat river surface while searching for an outlet.")
-                    .defineInRange("flatHeadTolerance", 1, 0, 8);
+                    .comment("Maximum WPO head difference treated as the same flat river surface while searching for an outlet."
+                            + " Must exceed the mod's own level transients (see minFallbackHeadDrop) or the BFS's"
+                            + " connectivity check itself fragments into a different, slosh-shaped reachable region"
+                            + " from every origin, so nearby columns can find different outlets - or none at all.")
+                    .defineInRange("flatHeadTolerance", 4, 0, 8);
             flatMinOutletDrop = translate.apply("flatMinOutletDrop")
-                    .comment("Minimum WPO head drop that makes a neighbor count as the outlet of a flat river component.")
-                    .defineInRange("flatMinOutletDrop", 1, 1, 64);
+                    .comment("Minimum WPO head drop that makes a neighbor count as the outlet of a flat river component."
+                            + " Must exceed the mod's own level transients (river feeding/refilling moves up to"
+                            + " maxTransferLevels=4 into single columns per scan) or the solver chases that noise and"
+                            + " nearby columns commit conflicting directions. A real 1-block step is 8."
+                            + " Must stay above flatHeadTolerance: a head diff between the two values is neither"
+                            + " a same-surface cell nor a qualifying outlet, so the BFS just stalls on it.")
+                    .defineInRange("flatMinOutletDrop", 6, 1, 64);
+            flatMinOutletBedDrop = translate.apply("flatMinOutletBedDrop")
+                    .comment("Minimum solid streambed height drop (OCEAN_FLOOR heightmap, in blocks) required on top of"
+                            + " flatMinOutletDrop for a flat-solver outlet to qualify. A wide pool's own level slosh can"
+                            + " fake a WPO head drop within a few columns without the terrain actually descending -"
+                            + " requiring a real bed step keeps mid-pool columns from latching onto that as a fake exit.")
+                    .defineInRange("flatMinOutletBedDrop", 1, 0, 16);
             waterBodyMagnetRadius = translate.apply("waterBodyMagnetRadius")
                     .comment("Horizontal radius used to find nearby river/lake mass for water-body magnetism.")
                     .defineInRange("waterBodyMagnetRadius", 32, 2, 96);
@@ -181,8 +206,12 @@ public final class RiverConfig {
                     .comment("Maximum downstream river cells searched when pushing physical flow through a full WPO river chain.")
                     .defineInRange("physicalFlowChainDistance", 32, 1, 128);
             minFallbackHeadDrop = translate.apply("minFallbackHeadDrop")
-                    .comment("Minimum absolute WPO head drop required for terrain fallback flow.")
-                    .defineInRange("minFallbackHeadDrop", 1, 1, 64);
+                    .comment("Minimum absolute WPO head drop required for terrain fallback flow."
+                            + " Must exceed the mod's own level transients (feeding/refilling and unloaded-edge"
+                            + " draining move up to 4 levels per scan) or columns chase self-inflicted slosh in"
+                            + " random directions instead of deferring to the coherent channel-axis solver."
+                            + " A real 1-block step is 8.")
+                    .defineInRange("minFallbackHeadDrop", 6, 1, 64);
             magnetMaxUphillHead = translate.apply("magnetMaxUphillHead")
                     .comment("Maximum WPO head climb allowed when magnetism bends flow toward a larger water body.")
                     .defineInRange("magnetMaxUphillHead", 16, 0, 64);
@@ -191,10 +220,14 @@ public final class RiverConfig {
                     .defineInRange("maxReservoirLevelsPerChunk", 4096, 8, 1_000_000);
             currentColumnDepth = translate.apply("currentColumnDepth")
                     .comment("Water blocks below the sampled river surface that inherit the same current for entity pushing.")
-                    .defineInRange("currentColumnDepth", 3, 1, 16);
+                    .defineInRange("currentColumnDepth", 16, 1, 16);
             currentMaxAgeTicks = translate.apply("currentMaxAgeTicks")
-                    .comment("Ticks before a cached river current expires if the column is not resampled.")
-                    .defineInRange("currentMaxAgeTicks", 600, 20, 12000);
+                    .comment("Ticks before a cached river current expires if the column is not resampled."
+                            + " Must comfortably exceed the mean resample interval at the edge of sampleRadius"
+                            + " (roughly (2*radius+1)^2 / columnChecksPerPlayer * updateInterval ticks), or"
+                            + " mid-distance columns expire between visits and every resolution out there is an"
+                            + " isolated re-seed with no neighbor context - visible as patchy, flickering flow.")
+                    .defineInRange("currentMaxAgeTicks", 6000, 20, 72000);
             builder.pop();
 
             builder.push("Hydrology");

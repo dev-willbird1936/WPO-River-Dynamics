@@ -5,10 +5,10 @@
       "generator": {
         "type": "minecraft:noise",
         "biome_source": {
-          "type": "minecraft:fixed",
-          "biome": "minecraft:river"
+          "type": "minecraft:multi_noise",
+          "preset": "minecraft:overworld"
         },
-        "settings": "minecraft:overworld"
+        "settings": "wpo_river_dynamics:riverlands"
       }
     },
     "minecraft:the_end": {

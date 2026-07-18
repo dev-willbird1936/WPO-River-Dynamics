@@ -21,8 +21,11 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.skds.wpo.api.WPOFluidAccess;
 
 final class OsmWaterwayProvider {
 
@@ -33,7 +36,8 @@ final class OsmWaterwayProvider {
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(6))
             .build();
-    private static final Map<TileKey, CompletableFuture<List<Waterway>>> TILE_CACHE = new ConcurrentHashMap<>();
+    private static final Map<TileKey, TileEntry> TILE_CACHE = new ConcurrentHashMap<>();
+    private static final long EMPTY_RETRY_BACKOFF_MILLIS = 5L * 60L * 1000L;
     private static final double EARTH_METERS_PER_DEGREE = 111_320.0D;
 
     Optional<FlowVector> findDirection(ServerLevel level, double blockX, double blockZ, TerrariumBridge.ProjectionContext projection) {
@@ -46,8 +50,8 @@ final class OsmWaterwayProvider {
         }
 
         double tileDegrees = RiverConfig.COMMON.osmTileDegrees.get();
-        TileKey tile = TileKey.from(geo.get(), tileDegrees);
-        CompletableFuture<List<Waterway>> future = TILE_CACHE.computeIfAbsent(tile, OsmWaterwayProvider::loadTileAsync);
+        TileKey tile = TileKey.from(level.dimension().location().toString(), geo.get(), tileDegrees);
+        CompletableFuture<List<Waterway>> future = tileFuture(tile);
         if (!future.isDone()) {
             return Optional.empty();
         }
@@ -60,15 +64,60 @@ final class OsmWaterwayProvider {
                 best = vector.get();
             }
         }
-        return Optional.ofNullable(best);
+        if (best == null) {
+            return Optional.empty();
+        }
+
+        // OSM way point order isn't guaranteed to follow real-world flow direction - a
+        // backwards-digitized way would otherwise silently reverse the published flow with
+        // nothing to catch it. Only reject a clear uphill step; flat bed reaches (deltas,
+        // wide slow water) are common and aren't evidence the geometry is wrong.
+        if (!matchesBedSlope(level, blockX, blockZ, best.direction())) {
+            if (RiverConfig.COMMON.debugLogging.get()) {
+                RiverDynamics.LOGGER.debug(
+                        "OSM waterway direction {} at {},{} climbs the bed slope; ignoring possibly backwards-digitized way",
+                        best.direction(), blockX, blockZ);
+            }
+            return Optional.empty();
+        }
+        return Optional.of(best);
+    }
+
+    private static boolean matchesBedSlope(ServerLevel level, double blockX, double blockZ, Direction direction) {
+        int sourceX = (int) Math.floor(blockX);
+        int sourceZ = (int) Math.floor(blockZ);
+        int targetX = sourceX + direction.getStepX();
+        int targetZ = sourceZ + direction.getStepZ();
+        BlockPos target = new BlockPos(targetX, level.getMinBuildHeight(), targetZ);
+        if (!WPOFluidAccess.isChunkLoaded(level, target)) {
+            return true;
+        }
+        int sourceBed = level.getHeight(Heightmap.Types.OCEAN_FLOOR, sourceX, sourceZ);
+        int targetBed = level.getHeight(Heightmap.Types.OCEAN_FLOOR, targetX, targetZ);
+        return targetBed <= sourceBed;
     }
 
     static void clear(ServerLevel level) {
-        TILE_CACHE.clear();
+        String dimension = level.dimension().location().toString();
+        TILE_CACHE.keySet().removeIf(key -> key.dimension().equals(dimension));
+    }
+
+    // A tile that failed (or genuinely has no mapped waterways) resolves to an empty list either
+    // way - retry it after a backoff instead of caching that result forever for the session.
+    private static CompletableFuture<List<Waterway>> tileFuture(TileKey tile) {
+        TileEntry existing = TILE_CACHE.get(tile);
+        if (existing != null && existing.future().isDone() && existing.future().getNow(List.of()).isEmpty()
+                && System.currentTimeMillis() - existing.fetchedAtMillis() > EMPTY_RETRY_BACKOFF_MILLIS) {
+            TILE_CACHE.remove(tile, existing);
+        }
+        return TILE_CACHE.computeIfAbsent(tile, key -> new TileEntry(loadTileAsync(key), System.currentTimeMillis())).future();
     }
 
     private static CompletableFuture<List<Waterway>> loadTileAsync(TileKey tile) {
         return CompletableFuture.supplyAsync(() -> fetchTile(tile));
+    }
+
+    private record TileEntry(CompletableFuture<List<Waterway>> future, long fetchedAtMillis) {
     }
 
     private static List<Waterway> fetchTile(TileKey tile) {
@@ -183,9 +232,9 @@ final class OsmWaterwayProvider {
     record FlowVector(Direction direction, double distanceMeters) {
     }
 
-    private record TileKey(int lat, int lon, double degrees) {
-        static TileKey from(TerrariumBridge.GeoPoint point, double degrees) {
-            return new TileKey((int) Math.floor(point.lat() / degrees), (int) Math.floor(point.lon() / degrees), degrees);
+    private record TileKey(String dimension, int lat, int lon, double degrees) {
+        static TileKey from(String dimension, TerrariumBridge.GeoPoint point, double degrees) {
+            return new TileKey(dimension, (int) Math.floor(point.lat() / degrees), (int) Math.floor(point.lon() / degrees), degrees);
         }
 
         Bounds bounds() {
