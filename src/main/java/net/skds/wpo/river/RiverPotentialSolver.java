@@ -560,7 +560,11 @@ final class RiverPotentialSolver {
             long cell = queue.removeFirst();
             int cx = x(cell);
             int cz = z(cell);
-            for (int[] step : CARDINAL) {
+            // Water cells only touching the rest of the body diagonally are a supported
+            // shape (see the diagonal-only-link handling in skeletonNeighbors/thin) - a
+            // cardinal-only spread can leave such a cell without an owner, and every cell
+            // in the input set is later looked up unconditionally.
+            for (int[] step : AROUND) {
                 long neighbor = key(cx + step[0], cz + step[1]);
                 if (cells.contains(neighbor) && owner.putIfAbsent(neighbor, owner.get(cell)) == null) {
                     queue.addLast(neighbor);

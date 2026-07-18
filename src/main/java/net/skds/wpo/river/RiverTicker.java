@@ -148,6 +148,7 @@ public final class RiverTicker {
             return;
         }
         if (!explicitMappedRiver && terrarium != null && terrarium.elevationMeters() <= 0) {
+            RiverCurrentField.clear(level, waterPos);
             return;
         }
 
